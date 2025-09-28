@@ -252,7 +252,9 @@ app = FastAPI(
 API para crear tickets cifrados en QR y validarlos (uso único).
 Incluye auth por token Bearer y permisos por endpoint.
 Soporta fecha y hora del evento (event_at).
-"""
+""",
+    docs_url = "/swagger",
+    swagger_ui_parameters = {"defaultModelsExpandDepth": -1},  # Oculta schemas al abrir
 )
 
 app.add_middleware(
