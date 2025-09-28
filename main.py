@@ -1,6 +1,8 @@
 ﻿import base64
 import io
 import json
+import pathlib
+import re
 import uuid
 import secrets
 from datetime import datetime, date, time, timezone, timedelta
@@ -23,6 +25,7 @@ class Settings(BaseSettings):
     SECRET_KEY: Optional[str] = None
     DATABASE_URL: str = "sqlite:///./tickets.db"
     TOKEN_TTL_HOURS: int = 8
+    RESET_DB_ON_DEPLOY: bool = False   # 👈 NUEVO
 
     class Config:
         env_file = ".env"
@@ -33,23 +36,82 @@ if not settings.SECRET_KEY:
     settings.SECRET_KEY = Fernet.generate_key().decode("utf-8")
 fernet = Fernet(settings.SECRET_KEY.encode("utf-8"))
 
+def maybe_reset_sqlite():
+    if not settings.RESET_DB_ON_DEPLOY:
+        return
+    if not settings.DATABASE_URL.startswith("sqlite"):
+        return
+
+    m = re.match(r"^sqlite:///(.+)$", settings.DATABASE_URL)
+    if not m:
+        return
+    db_path = pathlib.Path(m.group(1)).resolve()
+    if db_path.exists():
+        db_path.unlink()
+        print(f"[reset] Base de datos SQLite eliminada: {db_path}")
+
+maybe_reset_sqlite()
+
 # ----------------------------
 # Usuarios demo + permisos
 # ----------------------------
 USER_DB: Dict[str, Dict[str, Any]] = {
-    "admin": {
-        "password": "admin123",
-        "perms": {"health:read", "tickets:create", "tickets:validate", "tickets:read_status", "tickets:list"},
+    "admin_lobo": {
+    "password": "L0b0#Adm!n2025",
+    "perms": [
+            "health:read",
+            "tickets:create",
+            "tickets:validate",
+            "tickets:read_status",
+            "tickets:list"
+        ]
     },
-    "taquilla": {
-        "password": "scan2025",
-        "perms": {"health:read", "tickets:validate", "tickets:read_status", "tickets:list"},
+    "admin_aguila": {
+    "password": "AgU1l@Adm#45",
+    "perms": [
+            "health:read",
+            "tickets:create",
+            "tickets:validate",
+            "tickets:read_status",
+             "tickets:list"
+        ]
     },
-    "organizador": {
-        "password": "evento",
-        "perms": {"health:read", "tickets:create", "tickets:read_status", "tickets:list"},
+    "taquilla_tigre": {
+        "password": "T1gr3#Scan2025",
+        "perms": [
+            "health:read",
+            "tickets:validate",
+            "tickets:read_status",
+            "tickets:list"
+        ]
     },
+    "taquilla_oso": {
+        "password": "0s0#Taq@78",
+        "perms": [
+            "health:read",
+            "tickets:validate",
+            "tickets:read_status",
+            "tickets:list"
+        ]
+    },
+    "viewer_delfin": {
+        "password": "D3lf!n#View25",
+        "perms": [
+            "health:read",
+            "tickets:read_status",
+            "tickets:list"
+        ]
+    },
+    "viewer_zorro": {
+        "password": "Z0rr0!Lst#9",
+        "perms": [
+            "health:read",
+            "tickets:read_status",
+            "tickets:list"
+        ]
+    }
 }
+
 
 TOKENS: Dict[str, Dict[str, Any]] = {}
 bearer_scheme = HTTPBearer(auto_error=True)
@@ -83,6 +145,7 @@ def require_perm(required_perm: str) -> Callable:
             raise HTTPException(status_code=403, detail=f"Permiso faltante: {required_perm}")
         return payload
     return _dep
+
 
 # ----------------------------
 # DB (SQLAlchemy)
