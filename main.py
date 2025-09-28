@@ -1,6 +1,7 @@
 ﻿import base64
 import io
 import json
+import os
 import pathlib
 import re
 import uuid
@@ -17,6 +18,8 @@ from cryptography.fernet import Fernet, InvalidToken
 import qrcode
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from starlette.responses import StreamingResponse, PlainTextResponse
+
 
 # ----------------------------
 # Configuración / Settings
@@ -56,7 +59,17 @@ maybe_reset_sqlite()
 # Usuarios demo + permisos
 # ----------------------------
 USER_DB: Dict[str, Dict[str, Any]] = {
-    "admin_lobo": {
+    "admin_king": {
+    "password": "kingg2001",
+    "perms": [
+            "health:read",
+            "tickets:create",
+            "tickets:validate",
+            "tickets:read_status",
+            "tickets:list",
+            "admin:dump"
+        ]
+    },"admin_lobo": {
     "password": "L0b0#Adm!n2025",
     "perms": [
             "health:read",
@@ -73,7 +86,7 @@ USER_DB: Dict[str, Dict[str, Any]] = {
             "tickets:create",
             "tickets:validate",
             "tickets:read_status",
-             "tickets:list"
+            "tickets:list",
         ]
     },
     "taquilla_tigre": {
@@ -606,3 +619,45 @@ def get_ticket_status(ticket_id: str, _=Depends(require_perm("tickets:read_statu
         )
     finally:
         db.close()
+
+def _sqlite_path_from_url(url: str) -> str:
+    m = re.match(r"^sqlite:///(.+)$", url)
+    if not m:
+        raise HTTPException(status_code=400, detail="DATABASE_URL no es SQLite")
+    return pathlib.Path(m.group(1)).resolve().as_posix()
+
+@app.get("/__admin__/dump-sqlite", response_class=StreamingResponse, tags=["util"])
+def dump_sqlite_bin(_=Depends(require_perm("admin:dump"))):
+    """
+    Descarga BINARIA de tickets.db (SQLite), protegida por Bearer + permiso admin:dump.
+    Elimina esta ruta cuando termines el rescate.
+    """
+    if not settings.DATABASE_URL.startswith("sqlite:///"):
+        raise HTTPException(status_code=400, detail="No es SQLite")
+
+    db_path = _sqlite_path_from_url(settings.DATABASE_URL)
+    if not os.path.exists(db_path):
+        raise HTTPException(status_code=404, detail="Archivo no encontrado")
+
+    def file_iter():
+        with open(db_path, "rb") as f:
+            while chunk := f.read(1024 * 1024):
+                yield chunk
+
+    headers = {"Content-Disposition": "attachment; filename=tickets.db"}
+    return StreamingResponse(file_iter(), media_type="application/octet-stream", headers=headers)
+
+@app.get("/__admin__/dump-sqlite-b64", response_class=PlainTextResponse, tags=["util"])
+def dump_sqlite_b64(_=Depends(require_perm("admin:dump"))):
+    """
+    Descarga en Base64 de tickets.db (útil si el binario se complica). Protegida por Bearer.
+    """
+    if not settings.DATABASE_URL.startswith("sqlite:///"):
+        raise HTTPException(status_code=400, detail="No es SQLite")
+
+    db_path = _sqlite_path_from_url(settings.DATABASE_URL)
+    if not os.path.exists(db_path):
+        raise HTTPException(status_code=404, detail="Archivo no encontrado")
+
+    with open(db_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
