@@ -41,6 +41,7 @@ fernet = Fernet(settings.SECRET_KEY.encode("utf-8"))
 
 def maybe_reset_sqlite():
     if not settings.RESET_DB_ON_DEPLOY:
+        print("NO Resetting SQLite database")
         return
     if not settings.DATABASE_URL.startswith("sqlite"):
         return
@@ -69,7 +70,8 @@ USER_DB: Dict[str, Dict[str, Any]] = {
             "tickets:list",
             "admin:dump"
         ]
-    },"admin_lobo": {
+    },
+    "admin_lobo": {
     "password": "L0b0#Adm!n2025",
     "perms": [
             "health:read",
