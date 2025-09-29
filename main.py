@@ -239,6 +239,7 @@ class ValidateTicketResponse(BaseModel):
 
 class TicketStatusResponse(BaseModel):
     ticket_id: str
+    # qr_png_base64: str
     valid: bool
     is_used: bool
     purchaser_name: str
@@ -342,7 +343,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # ----------------------------
 # Auth
 # ----------------------------
@@ -511,6 +511,77 @@ def validate_ticket(req: ValidateTicketRequest, _ : Dict[str, Any] = Depends(req
     finally:
         db.close()
 
+# ✅ Validación "solo lectura": no cambia estado del ticket
+@app.post("/validate/peek", response_model=ValidateTicketResponse, tags=["tickets"])
+def validate_ticket_peek(req: ValidateTicketRequest, _ : Dict[str, Any] = Depends(require_perm("tickets:validate"))):
+    # 1) Descifrar
+    try:
+        payload = decrypt_payload(req.qr)
+    except InvalidToken:
+        return ValidateTicketResponse(valid=False, reason="QR inválido o manipulado")
+
+    # 2) Campos mínimos
+    ticket_id = payload.get("ticket_id")
+    version = payload.get("version")
+    if version != "v1" or not ticket_id:
+        return ValidateTicketResponse(valid=False, reason="Formato de payload inválido")
+
+    # 3) Buscar en DB (solo lectura lógica)
+    db = SessionLocal()
+    try:
+        t: Ticket = db.get(Ticket, ticket_id)
+        if not t:
+            return ValidateTicketResponse(valid=False, reason="Ticket no existe")
+
+        # 4) Coincidencia exacta del ciphertext
+        if t.qr_ciphertext != req.qr:
+            return ValidateTicketResponse(valid=False, reason="QR no coincide con registro")
+
+        # 5) Expiración (normalizada)
+        now = datetime.now(timezone.utc)
+        exp_dt = _utc(t.expires_at)
+        if exp_dt and now > exp_dt:
+            return ValidateTicketResponse(
+                valid=False,
+                reason="Ticket expirado",
+                ticket_id=t.id,
+                purchaser_name=t.purchaser_name,
+                event_id=t.event_id,
+                event_date=t.event_date,
+                national_id=t.national_id,
+                phone=t.phone,
+                used_at=_utc(t.used_at),
+            )
+
+        # 6) Si ya fue usado, informarlo (pero no cambiar nada)
+        if t.is_used:
+            return ValidateTicketResponse(
+                valid=False,
+                reason="Ticket ya fue usado",
+                ticket_id=t.id,
+                purchaser_name=t.purchaser_name,
+                event_id=t.event_id,
+                event_date=t.event_date,
+                national_id=t.national_id,
+                phone=t.phone,
+                used_at=_utc(t.used_at),
+            )
+
+        # 7) Válido y SIN modificar estado
+        return ValidateTicketResponse(
+            valid=True,
+            ticket_id=t.id,
+            purchaser_name=t.purchaser_name,
+            event_id=t.event_id,
+            event_date=t.event_date,
+            national_id=t.national_id,
+            phone=t.phone,
+            used_at=None,  # no se marca uso
+        )
+    finally:
+        db.close()
+
+
 # Rutas estáticas antes de la dinámica {ticket_id}
 @app.get("/tickets/summary", response_model=TicketSummaryResponse, tags=["tickets"])
 def tickets_summary(_=Depends(require_perm("tickets:list"))):
@@ -581,7 +652,14 @@ def tickets_list(
                 created_by=t.created_by,
                 validated_by=t.validated_by,
             ))
-
+        print(TicketListResponse(
+            items=items,
+            total=total,
+            used=used_count,
+            unused=unused_count,
+            page=page,
+            page_size=page_size,
+        ))
         return TicketListResponse(
             items=items,
             total=total,
@@ -607,6 +685,7 @@ def get_ticket_status(ticket_id: str, _=Depends(require_perm("tickets:read_statu
 
         return TicketStatusResponse(
             ticket_id=t.id,
+            # qr_png_base64= make_qr_png_base64(t.qr_ciphertext),
             valid=valid,
             is_used=t.is_used,
             purchaser_name=t.purchaser_name,
