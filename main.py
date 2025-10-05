@@ -2,17 +2,18 @@
 import io
 import json
 import os
-import pathlib
 import re
 import uuid
 import secrets
 from datetime import datetime, date, time, timezone, timedelta
 from typing import Optional, Callable, Dict, Any, Set, List
 
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-from sqlalchemy import create_engine, Column, String, DateTime, Text, Boolean, Date, func, or_
+from sqlalchemy import (
+    create_engine, Column, String, DateTime, Text, Boolean, Date, func, or_, Index
+)
 from sqlalchemy.orm import sessionmaker, declarative_base
 from cryptography.fernet import Fernet, InvalidToken
 import qrcode
@@ -26,70 +27,64 @@ from starlette.responses import StreamingResponse, PlainTextResponse
 # ----------------------------
 class Settings(BaseSettings):
     SECRET_KEY: Optional[str] = None
-    DATABASE_URL: str = "sqlite:///./tickets.db"
+    # Mantén la misma variable de entorno: DATABASE_URL. Railway la puede exponer como tal.
+    DATABASE_URL: str = os.getenv(
+        "DATABASE_URL",
+        "postgresql+psycopg://postgres:postgres@localhost:5432/tickets",
+    )
     TOKEN_TTL_HOURS: int = 8
-    RESET_DB_ON_DEPLOY: bool = False   # 👈 NUEVO
 
+    # NUEVO: migración controlada por flag en .env
+    MIGRATE_DATA: bool = Field(default=False, description="Si True, migra datos desde SQLite")
+    SQLITE_URL: str = Field(
+        default=os.getenv("SQLITE_URL", "sqlite:///./tickets.db"),
+        description="Origen SQLite para migrar datos",
+    )
+    RESET_DB_ON_DEPLOY: bool = False
     class Config:
         env_file = ".env"
 
 settings = Settings()
 
 if not settings.SECRET_KEY:
+    # En producción, define SECRET_KEY en el entorno. Aquí solo generamos una por defecto.
     settings.SECRET_KEY = Fernet.generate_key().decode("utf-8")
 fernet = Fernet(settings.SECRET_KEY.encode("utf-8"))
-
-def maybe_reset_sqlite():
-    if not settings.RESET_DB_ON_DEPLOY:
-        print("NO Resetting SQLite database")
-        return
-    if not settings.DATABASE_URL.startswith("sqlite"):
-        return
-
-    m = re.match(r"^sqlite:///(.+)$", settings.DATABASE_URL)
-    if not m:
-        return
-    db_path = pathlib.Path(m.group(1)).resolve()
-    if db_path.exists():
-        db_path.unlink()
-        print(f"[reset] Base de datos SQLite eliminada: {db_path}")
-
-maybe_reset_sqlite()
 
 # ----------------------------
 # Usuarios demo + permisos
 # ----------------------------
 USER_DB: Dict[str, Dict[str, Any]] = {
     "admin_king": {
-    "password": "kingg2001",
-    "perms": [
+        "password": "kingg2001",
+        "perms": [
             "health:read",
             "tickets:create",
             "tickets:validate",
             "tickets:read_status",
             "tickets:list",
-            "admin:dump"
-        ]
+            "admin:dump",
+        ],
     },
     "admin_lobo": {
-    "password": "L0b0#Adm!n2025",
-    "perms": [
-            "health:read",
-            "tickets:create",
-            "tickets:validate",
-            "tickets:read_status",
-            "tickets:list"
-        ]
-    },
-    "admin_aguila": {
-    "password": "AgU1l@Adm#45",
-    "perms": [
+        "password": "L0b0#Adm!n2025",
+        "perms": [
             "health:read",
             "tickets:create",
             "tickets:validate",
             "tickets:read_status",
             "tickets:list",
-        ]
+        ],
+    },
+    "admin_aguila": {
+        "password": "AgU1l@Adm#45",
+        "perms": [
+            "health:read",
+            "tickets:create",
+            "tickets:validate",
+            "tickets:read_status",
+            "tickets:list",
+        ],
     },
     "taquilla_tigre": {
         "password": "T1gr3#Scan2025",
@@ -97,8 +92,8 @@ USER_DB: Dict[str, Dict[str, Any]] = {
             "health:read",
             "tickets:validate",
             "tickets:read_status",
-            "tickets:list"
-        ]
+            "tickets:list",
+        ],
     },
     "taquilla_oso": {
         "password": "0s0#Taq@78",
@@ -106,27 +101,18 @@ USER_DB: Dict[str, Dict[str, Any]] = {
             "health:read",
             "tickets:validate",
             "tickets:read_status",
-            "tickets:list"
-        ]
+            "tickets:list",
+        ],
     },
     "viewer_delfin": {
         "password": "D3lf!n#View25",
-        "perms": [
-            "health:read",
-            "tickets:read_status",
-            "tickets:list"
-        ]
+        "perms": ["health:read", "tickets:read_status", "tickets:list"],
     },
     "viewer_zorro": {
         "password": "Z0rr0!Lst#9",
-        "perms": [
-            "health:read",
-            "tickets:read_status",
-            "tickets:list"
-        ]
-    }
+        "perms": ["health:read", "tickets:read_status", "tickets:list"],
+    },
 }
-
 
 TOKENS: Dict[str, Dict[str, Any]] = {}
 bearer_scheme = HTTPBearer(auto_error=True)
@@ -161,26 +147,26 @@ def require_perm(required_perm: str) -> Callable:
         return payload
     return _dep
 
-
 # ----------------------------
-# DB (SQLAlchemy)
+# DB (SQLAlchemy) - Postgres
 # ----------------------------
 engine = create_engine(
     settings.DATABASE_URL,
-    connect_args={"check_same_thread": False} if settings.DATABASE_URL.startswith("sqlite") else {}
+    pool_pre_ping=True,
+    pool_recycle=1800,  # opcional
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 class Ticket(Base):
     __tablename__ = "tickets"
-    id = Column(String, primary_key=True)                  # UUID
+    id = Column(String, primary_key=True)  # UUID
     purchaser_name = Column(String, nullable=False)
     event_id = Column(String, nullable=False)
     national_id = Column(String, nullable=False)
     phone = Column(String, nullable=True)
 
-    # NUEVO: fecha + hora del evento (UTC aware)
+    # fecha + hora del evento (UTC aware)
     event_at = Column(DateTime(timezone=True), nullable=True)
 
     # Conservado por compatibilidad y filtros rápidos
@@ -193,10 +179,98 @@ class Ticket(Base):
     qr_ciphertext = Column(Text, nullable=False)
     version = Column(String, default="v1", nullable=False)
 
-    created_by = Column(String, nullable=False)            # usuario que creó
-    validated_by = Column(String, nullable=True)           # usuario que validó (si aplica)
+    created_by = Column(String, nullable=False)  # usuario que creó
+    validated_by = Column(String, nullable=True)  # usuario que validó (si aplica)
+
+# Índices recomendados en Postgres
+Index("ix_tickets_purchaser_name", Ticket.purchaser_name)
+Index("ix_tickets_national_id", Ticket.national_id)
+Index("ix_tickets_event_id", Ticket.event_id)
+Index("ix_tickets_event_at", Ticket.event_at)
+Index("ix_tickets_is_used", Ticket.is_used)
+
+# Tabla meta para marcar migraciones
+class MetaKV(Base):
+    __tablename__ = "meta_kv"
+    key = Column(String, primary_key=True)
+    value = Column(String, nullable=False)
 
 Base.metadata.create_all(bind=engine)
+
+# ----------------------------
+# Migración opcional: SQLite -> Postgres
+# ----------------------------
+from sqlalchemy.exc import SQLAlchemyError
+
+def _utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def _maybe_migrate_sqlite_to_postgres():
+    if not settings.MIGRATE_DATA:
+        return
+
+    # Usa una transacción para marcar que ya migramos
+    db = SessionLocal()
+    try:
+        # ¿Ya migramos antes?
+        done = db.get(MetaKV, "sqlite_migrated")
+        if done and done.value == "1":
+            return
+
+        # Conecta al SQLite origen
+        sqlite_engine = create_engine(settings.SQLITE_URL, connect_args={"check_same_thread": False} if settings.SQLITE_URL.startswith("sqlite") else {})
+        SqlSession = sessionmaker(bind=sqlite_engine)
+        ssrc = SqlSession()
+        try:
+            rows: List[Ticket] = ssrc.query(Ticket).all()
+        except Exception:
+            # Si la tabla no existe en SQLite, no hay nada que migrar
+            rows = []
+        finally:
+            ssrc.close()
+
+        inserted = 0
+        for t in rows:
+            if db.get(Ticket, t.id):
+                continue  # ya existe
+            clone = Ticket(
+                id=t.id,
+                purchaser_name=t.purchaser_name,
+                event_id=t.event_id,
+                national_id=t.national_id,
+                phone=t.phone,
+                event_date=t.event_date,
+                event_at=_utc(t.event_at),
+                created_at=_utc(t.created_at),
+                expires_at=_utc(t.expires_at),
+                used_at=_utc(t.used_at),
+                is_used=t.is_used,
+                qr_ciphertext=t.qr_ciphertext,
+                version=t.version,
+                created_by=t.created_by,
+                validated_by=t.validated_by,
+            )
+            db.add(clone)
+            inserted += 1
+
+        # Marca migración como hecha
+        kv = MetaKV(key="sqlite_migrated", value="1")
+        db.merge(kv)
+        db.commit()
+        print(f"[migrate] Migración completada. Filas insertadas: {inserted}")
+    except SQLAlchemyError as e:
+        db.rollback()
+        print(f"[migrate] Error de migración: {e}")
+        raise
+    finally:
+        db.close()
+
+# Ejecuta migración si procede al iniciar la app
+_maybe_migrate_sqlite_to_postgres()
 
 # ----------------------------
 # Modelos de entrada/salida
@@ -207,7 +281,6 @@ class CreateTicketRequest(BaseModel):
     national_id: str = Field(..., description="Cédula")
     phone: Optional[str] = Field(None, description="Teléfono (opcional)")
     event_date: date = Field(..., description="Fecha del evento (YYYY-MM-DD)")
-    # NUEVO: permite especificar la hora exacta del evento
     event_at: Optional[datetime] = Field(None, description="Fecha y hora del evento (ISO8601, recomendado)")
     expires_at: Optional[datetime] = Field(None, description="Vencimiento del QR (UTC, opcional)")
 
@@ -239,7 +312,6 @@ class ValidateTicketResponse(BaseModel):
 
 class TicketStatusResponse(BaseModel):
     ticket_id: str
-    # qr_png_base64: str
     valid: bool
     is_used: bool
     purchaser_name: str
@@ -262,7 +334,7 @@ class LoginResponse(BaseModel):
     expires_at: datetime
 
 class TicketListItem(BaseModel):
-    n: int                        # enumeración (1..)
+    n: int
     ticket_id: str
     purchaser_name: str
     event_id: str
@@ -293,14 +365,17 @@ class TicketSummaryResponse(BaseModel):
 # ----------------------------
 # Utilidades de cifrado / QR
 # ----------------------------
+
 def encrypt_payload(payload: dict) -> str:
     data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     token: bytes = fernet.encrypt(data)
     return token.decode("utf-8")
 
+
 def decrypt_payload(ciphertext: str) -> dict:
     data = fernet.decrypt(ciphertext.encode("utf-8"))
     return json.loads(data.decode("utf-8"))
+
 
 def make_qr_png_base64(text: str) -> str:
     img = qrcode.make(text)
@@ -309,12 +384,14 @@ def make_qr_png_base64(text: str) -> str:
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     return f"data:image/png;base64,{b64}"
 
+
 def _utc(dt: Optional[datetime]) -> Optional[datetime]:
     if dt is None:
         return None
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
 
 def _to_utc(dt: Optional[datetime]) -> Optional[datetime]:
     if dt is None:
@@ -326,14 +403,17 @@ def _to_utc(dt: Optional[datetime]) -> Optional[datetime]:
 # ----------------------------
 app = FastAPI(
     title="QR Tickets API (cifrado)",
-    version="1.3.0",
-    description="""
+    version="2.0.0",
+    description=(
+        """
 API para crear tickets cifrados en QR y validarlos (uso único).
 Incluye auth por token Bearer y permisos por endpoint.
 Soporta fecha y hora del evento (event_at).
-""",
-    docs_url = "/swagger",
-    swagger_ui_parameters = {"defaultModelsExpandDepth": -1},  # Oculta schemas al abrir
+Backend en **Postgres** (Railway) usando la misma variable `DATABASE_URL`.
+"""
+    ),
+    docs_url="/swagger",
+    swagger_ui_parameters={"defaultModelsExpandDepth": -1},
 )
 
 app.add_middleware(
@@ -343,6 +423,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # ----------------------------
 # Auth
 # ----------------------------
@@ -355,31 +436,37 @@ def login(body: LoginRequest):
     exp = TOKENS[token]["exp"]
     return LoginResponse(access_token=token, expires_at=exp)
 
+
 @app.post("/logout", tags=["auth"])
 def logout(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)):
     token = credentials.credentials
     TOKENS.pop(token, None)
     return {"ok": True}
 
+
 @app.get("/me", tags=["auth"])
 def whoami(payload: Dict[str, Any] = Depends(require_perm("health:read"))):
     return {"user": payload["user"], "perms": sorted(list(payload["perms"]))}
+
 
 # ----------------------------
 # Util
 # ----------------------------
 @app.get("/health", tags=["util"])
 def health():
-    return {"status": "ok", "algo": "qr-tickets", "version": "1.3.0"}
+    return {"status": "ok", "algo": "qr-tickets", "version": "2.0.0"}
+
 
 # ----------------------------
 # Tickets
 # ----------------------------
 @app.post("/tickets", response_model=CreateTicketResponse, tags=["tickets"])
-def create_ticket(req: CreateTicketRequest, _ : Dict[str, Any] = Depends(require_perm("tickets:create"))):
+def create_ticket(
+    req: CreateTicketRequest, _payload: Dict[str, Any] = Depends(require_perm("tickets:create"))
+):
     now = datetime.now(timezone.utc)
     ticket_id = str(uuid.uuid4())
-    created_by = _["user"]
+    created_by = _payload["user"]
 
     # Normaliza fechas
     exp_dt = _to_utc(req.expires_at)
@@ -398,8 +485,8 @@ def create_ticket(req: CreateTicketRequest, _ : Dict[str, Any] = Depends(require
         "purchaser_name": req.purchaser_name,
         "event_id": req.event_id,
         "national_id": req.national_id,
-        "phone": req.phone,                               # puede ser None
-        "event_date": req.event_date.isoformat(),         # "YYYY-MM-DD"
+        "phone": req.phone,  # puede ser None
+        "event_date": req.event_date.isoformat(),  # "YYYY-MM-DD"
         "event_at": event_at.isoformat().replace("+00:00", "Z"),
         "iat": int(now.timestamp()),
         "exp": int(exp_dt.timestamp()) if exp_dt else None,
@@ -445,10 +532,13 @@ def create_ticket(req: CreateTicketRequest, _ : Dict[str, Any] = Depends(require
         event_at=event_at,
     )
 
+
 @app.post("/validate", response_model=ValidateTicketResponse, tags=["tickets"])
-def validate_ticket(req: ValidateTicketRequest, _ : Dict[str, Any] = Depends(require_perm("tickets:validate"))):
+def validate_ticket(
+    req: ValidateTicketRequest, _payload: Dict[str, Any] = Depends(require_perm("tickets:validate"))
+):
     # 1) Descifrar
-    validator = _["user"]
+    validator = _payload["user"]
     try:
         payload = decrypt_payload(req.qr)
     except InvalidToken:
@@ -511,33 +601,31 @@ def validate_ticket(req: ValidateTicketRequest, _ : Dict[str, Any] = Depends(req
     finally:
         db.close()
 
+
 # ✅ Validación "solo lectura": no cambia estado del ticket
 @app.post("/validate/peek", response_model=ValidateTicketResponse, tags=["tickets"])
-def validate_ticket_peek(req: ValidateTicketRequest, _ : Dict[str, Any] = Depends(require_perm("tickets:validate"))):
-    # 1) Descifrar
+def validate_ticket_peek(
+    req: ValidateTicketRequest, _payload: Dict[str, Any] = Depends(require_perm("tickets:validate"))
+):
     try:
         payload = decrypt_payload(req.qr)
     except InvalidToken:
         return ValidateTicketResponse(valid=False, reason="QR inválido o manipulado")
 
-    # 2) Campos mínimos
     ticket_id = payload.get("ticket_id")
     version = payload.get("version")
     if version != "v1" or not ticket_id:
         return ValidateTicketResponse(valid=False, reason="Formato de payload inválido")
 
-    # 3) Buscar en DB (solo lectura lógica)
     db = SessionLocal()
     try:
         t: Ticket = db.get(Ticket, ticket_id)
         if not t:
             return ValidateTicketResponse(valid=False, reason="Ticket no existe")
 
-        # 4) Coincidencia exacta del ciphertext
         if t.qr_ciphertext != req.qr:
             return ValidateTicketResponse(valid=False, reason="QR no coincide con registro")
 
-        # 5) Expiración (normalizada)
         now = datetime.now(timezone.utc)
         exp_dt = _utc(t.expires_at)
         if exp_dt and now > exp_dt:
@@ -553,7 +641,6 @@ def validate_ticket_peek(req: ValidateTicketRequest, _ : Dict[str, Any] = Depend
                 used_at=_utc(t.used_at),
             )
 
-        # 6) Si ya fue usado, informarlo (pero no cambiar nada)
         if t.is_used:
             return ValidateTicketResponse(
                 valid=False,
@@ -567,7 +654,6 @@ def validate_ticket_peek(req: ValidateTicketRequest, _ : Dict[str, Any] = Depend
                 used_at=_utc(t.used_at),
             )
 
-        # 7) Válido y SIN modificar estado
         return ValidateTicketResponse(
             valid=True,
             ticket_id=t.id,
@@ -576,13 +662,15 @@ def validate_ticket_peek(req: ValidateTicketRequest, _ : Dict[str, Any] = Depend
             event_date=t.event_date,
             national_id=t.national_id,
             phone=t.phone,
-            used_at=None,  # no se marca uso
+            used_at=None,
         )
     finally:
         db.close()
 
 
-# Rutas estáticas antes de la dinámica {ticket_id}
+# ----------------------------
+# Listado y resumen
+# ----------------------------
 @app.get("/tickets/summary", response_model=TicketSummaryResponse, tags=["tickets"])
 def tickets_summary(_=Depends(require_perm("tickets:list"))):
     db = SessionLocal()
@@ -593,6 +681,7 @@ def tickets_summary(_=Depends(require_perm("tickets:list"))):
         return TicketSummaryResponse(total=total, used=used, unused=unused)
     finally:
         db.close()
+
 
 @app.get("/tickets/list", response_model=TicketListResponse, tags=["tickets"])
 def tickets_list(
@@ -615,51 +704,49 @@ def tickets_list(
 
         if q:
             like = f"%{q}%"
-            base = base.filter(or_(
-                Ticket.purchaser_name.ilike(like),
-                Ticket.national_id.ilike(like),
-                Ticket.event_id.ilike(like),
-                Ticket.id.ilike(like),
-            ))
+            base = base.filter(
+                or_(
+                    Ticket.purchaser_name.ilike(like),
+                    Ticket.national_id.ilike(like),
+                    Ticket.event_id.ilike(like),
+                    Ticket.id.ilike(like),
+                )
+            )
 
-        # Conteos filtrados
         total = base.order_by(None).count()
         used_count = base.filter(Ticket.is_used.is_(True)).order_by(None).count()
         unused_count = base.filter(Ticket.is_used.is_(False)).order_by(None).count()
 
-        # Ordena por event_at (hora del evento), luego created_at
-        rows = (base
-                .order_by(Ticket.event_at.desc(), Ticket.created_at.desc())
-                .offset(offset)
-                .limit(page_size)
-                .all())
+        rows = (
+            base.order_by(Ticket.event_at.desc(), Ticket.created_at.desc())
+            .offset(offset)
+            .limit(page_size)
+            .all()
+        )
 
         items = []
-        for i, t in enumerate(rows, start=1+offset):
-            items.append(TicketListItem(
-                n=i,
-                ticket_id=t.id,
-                purchaser_name=t.purchaser_name,
-                event_id=t.event_id,
-                national_id=t.national_id,
-                phone=t.phone,
-                event_date=t.event_date,
-                event_at=_utc(t.event_at) if t.event_at else _utc(datetime.combine(t.event_date, time(20,0)).replace(tzinfo=timezone.utc)),
-                created_at=_utc(t.created_at),
-                expires_at=_utc(t.expires_at),
-                used_at=_utc(t.used_at),
-                is_used=t.is_used,
-                created_by=t.created_by,
-                validated_by=t.validated_by,
-            ))
-        print(TicketListResponse(
-            items=items,
-            total=total,
-            used=used_count,
-            unused=unused_count,
-            page=page,
-            page_size=page_size,
-        ))
+        for i, t in enumerate(rows, start=1 + offset):
+            items.append(
+                TicketListItem(
+                    n=i,
+                    ticket_id=t.id,
+                    purchaser_name=t.purchaser_name,
+                    event_id=t.event_id,
+                    national_id=t.national_id,
+                    phone=t.phone,
+                    event_date=t.event_date,
+                    event_at=_utc(t.event_at)
+                    if t.event_at
+                    else _utc(datetime.combine(t.event_date, time(20, 0)).replace(tzinfo=timezone.utc)),
+                    created_at=_utc(t.created_at),
+                    expires_at=_utc(t.expires_at),
+                    used_at=_utc(t.used_at),
+                    is_used=t.is_used,
+                    created_by=t.created_by,
+                    validated_by=t.validated_by,
+                )
+            )
+
         return TicketListResponse(
             items=items,
             total=total,
@@ -670,6 +757,7 @@ def tickets_list(
         )
     finally:
         db.close()
+
 
 @app.get("/tickets/{ticket_id}", response_model=TicketStatusResponse, tags=["tickets"])
 def get_ticket_status(ticket_id: str, _=Depends(require_perm("tickets:read_status"))):
@@ -685,7 +773,6 @@ def get_ticket_status(ticket_id: str, _=Depends(require_perm("tickets:read_statu
 
         return TicketStatusResponse(
             ticket_id=t.id,
-            # qr_png_base64= make_qr_png_base64(t.qr_ciphertext),
             valid=valid,
             is_used=t.is_used,
             purchaser_name=t.purchaser_name,
@@ -693,7 +780,9 @@ def get_ticket_status(ticket_id: str, _=Depends(require_perm("tickets:read_statu
             national_id=t.national_id,
             phone=t.phone,
             event_date=t.event_date,
-            event_at=_utc(t.event_at) if t.event_at else _utc(datetime.combine(t.event_date, time(20,0)).replace(tzinfo=timezone.utc)),
+            event_at=_utc(t.event_at)
+            if t.event_at
+            else _utc(datetime.combine(t.event_date, time(20, 0)).replace(tzinfo=timezone.utc)),
             created_at=_utc(t.created_at),
             expires_at=exp_dt,
             used_at=_utc(t.used_at),
@@ -701,44 +790,95 @@ def get_ticket_status(ticket_id: str, _=Depends(require_perm("tickets:read_statu
     finally:
         db.close()
 
-def _sqlite_path_from_url(url: str) -> str:
-    m = re.match(r"^sqlite:///(.+)$", url)
-    if not m:
-        raise HTTPException(status_code=400, detail="DATABASE_URL no es SQLite")
-    return pathlib.Path(m.group(1)).resolve().as_posix()
 
-@app.get("/__admin__/dump-sqlite", response_class=StreamingResponse, tags=["util"])
-def dump_sqlite_bin(_=Depends(require_perm("admin:dump"))):
+import shlex
+import subprocess
+from urllib.parse import urlparse, unquote
+from fastapi.responses import StreamingResponse
+from fastapi import Depends
+
+# endpoint protegido: /__admin__/dump-postgres
+@app.get("/__admin__/dump-postgres", tags=["util"])
+def dump_postgres_stream(_=Depends(require_perm("admin:dump"))):
     """
-    Descarga BINARIA de tickets.db (SQLite), protegida por Bearer + permiso admin:dump.
-    Elimina esta ruta cuando termines el rescate.
+    Realiza un pg_dump (formato custom -Fc) y lo sirve como descarga.
+    Requisitos: pg_dump disponible en PATH del contenedor.
     """
-    if not settings.DATABASE_URL.startswith("sqlite:///"):
-        raise HTTPException(status_code=400, detail="No es SQLite")
+    raw = settings.DATABASE_URL  # puede ser postgresql://... o postgresql+psycopg://...
+    # normalizar esquema (pg_dump espera scheme postgresql)
+    parsed = urlparse(raw)
+    scheme = parsed.scheme.split('+')[0]  # 'postgresql' si venía 'postgresql+psycopg'
+    if scheme not in ("postgresql", "postgres"):
+        raise HTTPException(status_code=400, detail="DATABASE_URL no es PostgreSQL")
 
-    db_path = _sqlite_path_from_url(settings.DATABASE_URL)
-    if not os.path.exists(db_path):
-        raise HTTPException(status_code=404, detail="Archivo no encontrado")
+    # extraer componentes
+    user = parsed.username or ""
+    password = parsed.password or ""
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 5432
+    dbname = parsed.path.lstrip("/") or ""
 
-    def file_iter():
-        with open(db_path, "rb") as f:
-            while chunk := f.read(1024 * 1024):
+    # Comando pg_dump (formato custom -Fc) -> archivo binario más compacto
+    # Opciones: --no-owner y --no-privileges para evitar issues de roles al restaurar
+    cmd = [
+        "pg_dump",
+        "--format", "custom",         # -Fc
+        "--no-owner",
+        "--no-privileges",
+        "--host", host,
+        "--port", str(port),
+        "--username", user,
+        dbname,
+    ]
+
+    # Si deseas SQL plano (texto), usa "--format", "plain"
+    # cmd = ["pg_dump", "--format", "plain", "--no-owner", "--no-privileges", "--host", host, "--port", str(port), "--username", user, dbname]
+
+    # Evitar exponer credencial en args: pasamos PGPASSWORD en env del proceso
+    env = os.environ.copy()
+    if password:
+        env["PGPASSWORD"] = password
+
+    try:
+        # Lanzamos el proceso en modo streaming
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="pg_dump no encontrado en el PATH (instala pg_dump)")
+
+    def iter_dump():
+        try:
+            assert proc.stdout is not None
+            for chunk in iter(lambda: proc.stdout.read(1024 * 64), b""):
+                if not chunk:
+                    break
                 yield chunk
+            proc.stdout.close()
+            ret = proc.wait()
+            if ret != 0:
+                # recoge stderr y lo muestra (poco, sin contraseña)
+                err = proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else ""
+                raise RuntimeError(f"pg_dump falló (code={ret}): {err}")
+        finally:
+            # limpiar env PGPASSWORD por si acaso (aunque solo afecta al proceso hijo)
+            env.pop("PGPASSWORD", None)
 
-    headers = {"Content-Disposition": "attachment; filename=tickets.db"}
-    return StreamingResponse(file_iter(), media_type="application/octet-stream", headers=headers)
+    filename = f"dump_{dbname}_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.dump"
+    headers = {"Content-Disposition": f"attachment; filename={filename}"}
+    return StreamingResponse(iter_dump(), media_type="application/octet-stream", headers=headers)
 
-@app.get("/__admin__/dump-sqlite-b64", response_class=PlainTextResponse, tags=["util"])
-def dump_sqlite_b64(_=Depends(require_perm("admin:dump"))):
-    """
-    Descarga en Base64 de tickets.db (útil si el binario se complica). Protegida por Bearer.
-    """
-    if not settings.DATABASE_URL.startswith("sqlite:///"):
-        raise HTTPException(status_code=400, detail="No es SQLite")
+# ----------------------------
+# Nota sobre dumps/exports
+# ----------------------------
+# En Postgres ya no existen archivos .db locales; para respaldos usa pg_dump fuera de la app
+# o una ruta protegida que ejecute un proceso externo si lo necesitas (no recomendado en runtime).
 
-    db_path = _sqlite_path_from_url(settings.DATABASE_URL)
-    if not os.path.exists(db_path):
-        raise HTTPException(status_code=404, detail="Archivo no encontrado")
 
-    with open(db_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+# ----------------------------
+# Ejecución local (uvicorn)
+# ----------------------------
+# uvicorn main:app --reload --host 0.0.0.0 --port 8000

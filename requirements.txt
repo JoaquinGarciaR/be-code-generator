@@ -6,4 +6,4 @@ pydantic-settings
 cryptography
 qrcode[pil]
 python-multipart
-qrcode[pil]
+psycopg[binary]
